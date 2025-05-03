@@ -8,81 +8,104 @@
     <script>
         (async () => {
             const params = new URLSearchParams(location.search);
-            const feedUrl = params.get('feed'); // 获取要抓取的 RSS URL
+            const feedUrl = params.get('feed'); // 获取要抓取的 URL (可能是 JSON 或 RSS)
             const callbackName = params.get('callback'); // 获取回调函数名
 
-            // 基本参数验证
+            // --- 参数验证 (同之前) ---
             if (!feedUrl || !callbackName) {
                 const errorResponse = { error: { message: "错误：缺少 'feed' 或 'callback' URL 参数。" } };
-                // 必须用 document.write 输出，因为这是 <script> 标签请求的响应
                 document.write(`${callbackName || 'jsonpCallback'}(${JSON.stringify(errorResponse)});`);
                 console.error("JSONP Bridge Error: Missing parameters.");
                 return;
             }
-
-            // 验证回调函数名（防止基本的注入）
             if (!/^[a-zA-Z0-9_]+$/.test(callbackName)) {
                  const errorResponse = { error: { message: "错误：无效的 'callback' 参数名称。" } };
-                 document.write(`jsonpCallback(${JSON.stringify(errorResponse)});`); // Use default if name is invalid
+                 document.write(`jsonpCallback(${JSON.stringify(errorResponse)});`);
                  console.error("JSONP Bridge Error: Invalid callback name.");
                  return;
             }
 
+            let jsonpData = {}; // Initialize response object
+
             try {
-                // 使用 fetch 抓取目标 RSS Feed
                 console.log(`JSONP Bridge: Fetching ${feedUrl}`);
                 const response = await fetch(feedUrl, {
-                    headers: { // 添加 User-Agent 可能有助于避免被某些服务器阻止
-                       'User-Agent': 'GitHubPages-JSONP-Bridge/1.0 (+https://darside2002.github.io/JS-neocities-bridge/)' // 修改为你自己的信息
+                    headers: {
+                       'User-Agent': 'GitHubPages-JSONP-Bridge/1.0 (+https://darside2002.github.io/JS-neocities-bridge/)' // 可选
                     }
                 });
 
                 console.log(`JSONP Bridge: Fetch status for ${feedUrl}: ${response.status}`);
 
                 if (!response.ok) {
-                    // 如果 fetch 失败，也通过 JSONP 返回错误
                     throw new Error(`无法获取 Feed: ${response.status} ${response.statusText}`);
                 }
 
-                const feedContent = await response.text(); // 获取原始 XML/文本内容
+                const contentType = response.headers.get('Content-Type') || '';
+                let bodyContent;
 
-                 // 检查内容是否为空
-                 if (!feedContent || feedContent.trim().length === 0) {
-                    throw new Error(`从 ${feedUrl} 获取到的内容为空。`);
-                 }
+                // --- 智能判断内容类型 ---
+                if (contentType.includes('application/json')) {
+                    console.log(`JSONP Bridge: Detected JSON content type for ${feedUrl}. Parsing as JSON.`);
+                    bodyContent = await response.json(); // 解析为 JSON 对象
+                    if (!bodyContent) {
+                        throw new Error(`从 ${feedUrl} 获取到的 JSON 数据为空或无效。`);
+                    }
+                } else if (contentType.includes('application/xml') || contentType.includes('text/xml') || contentType.includes('application/rss+xml')) {
+                    console.log(`JSONP Bridge: Detected XML/RSS content type for ${feedUrl}. Reading as text.`);
+                    bodyContent = await response.text(); // 获取原始 XML 字符串
+                     if (!bodyContent || bodyContent.trim().length === 0) {
+                        throw new Error(`从 ${feedUrl} 获取到的 XML 内容为空。`);
+                    }
+                } else {
+                    console.log(`JSONP Bridge: Detected other content type (${contentType}) for ${feedUrl}. Reading as text.`);
+                     bodyContent = await response.text(); // 对于未知类型，也按文本处理
+                     if (!bodyContent || bodyContent.trim().length === 0) {
+                        throw new Error(`从 ${feedUrl} 获取到的内容为空。`);
+                     }
+                }
+                // ---------------------------
 
                 // 准备 JSONP 响应数据结构
-                const jsonpData = {
-                    contents: feedContent, // 将原始 XML 字符串放入 contents 字段
-                    status: { // 模拟 AllOrigins 的状态结构
+                jsonpData = {
+                    contents: bodyContent, // contents 可以是 JSON 对象或 XML 字符串
+                    status: {
                         url: feedUrl,
                         http_code: response.status,
-                        content_type: response.headers.get('Content-Type') || 'unknown'
+                        content_type: contentType
                     }
                 };
 
-                // 输出 JSONP 响应: callbackName({...});
-                // 使用 JSON.stringify 来确保内容被正确转义为 JavaScript 字符串
-                document.write(`${callbackName}(${JSON.stringify(jsonpData)});`);
-                console.log(`JSONP Bridge: Successfully returned data for ${feedUrl}`);
+                console.log(`JSONP Bridge: Successfully prepared data for ${feedUrl}. Type: ${typeof bodyContent}`);
 
             } catch (error) {
-                // 如果过程中出现任何错误，都通过 JSONP 返回错误信息
+                // 错误处理
                 console.error("JSONP Bridge Error:", error);
-                const errorResponse = {
+                jsonpData = { // Ensure jsonpData is defined even on error
                     error: {
                         message: error.message || '处理 Feed 时发生未知错误。',
-                        url: feedUrl // 包含失败的 URL 以便调试
+                        url: feedUrl
                     },
-                     status: { // 也包含状态信息
+                     status: {
                         url: feedUrl,
-                        http_code: 500, // Assume server error if fetch failed internally
+                        http_code: 500, // Assume internal error
                         content_type: 'unknown'
                     }
                 };
-                // 确保即使在错误情况下也调用回调函数
-                document.write(`${callbackName}(${JSON.stringify(errorResponse)});`);
             }
+
+            // --- 输出 JSONP 响应 ---
+            // 确保总是调用回调函数，无论成功还是失败
+            try {
+                document.write(`${callbackName}(${JSON.stringify(jsonpData)});`);
+            } catch (stringifyError) {
+                 // Handle potential circular structure errors in JSON.stringify
+                 console.error("JSONP Bridge Error: Failed to stringify response data.", stringifyError, jsonpData);
+                 const fallbackError = { error: { message: "无法序列化响应数据。" }, status: jsonpData.status || { url: feedUrl, http_code: 500 }};
+                 document.write(`${callbackName}(${JSON.stringify(fallbackError)});`);
+            }
+            // -----------------------
+
         })();
     </script>
 </body>
